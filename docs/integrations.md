@@ -18,6 +18,7 @@ Structured OAuth-backed tools the agent can use in chat and automation. Connect 
 | **Spotify** | Playback controls, search, queue management |
 | **Weather** | Current conditions and forecasts — no API key needed |
 | **Personal WhatsApp** | Per-account read and send with isolated access |
+| GitHub | Access repositories, issues, pull requests, and Actions workflows |
 
 ### Access Modes
 
@@ -27,15 +28,16 @@ Each connected account can be set to **Read/Write** (default) or **Read Only**. 
 
 Most providers require OAuth app credentials in server config before users can connect. See [Configuration: Official Integrations](configuration.md#official-integrations) for the required environment variables.
 
-Home Assistant and Trello can be configured per-user in the **Integrations** UI without any server-side setup.
+* **GitHub**: Requires `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`.
+* **Home Assistant and Trello**: Can be configured per-user in the Integrations UI without any server-side setup.
 
 The default OAuth callback URL is `PUBLIC_URL + /api/integrations/oauth/callback`.
 
-**If an OAuth connection fails:**
-1. Confirm `PUBLIC_URL` is reachable by the provider
-2. Confirm the redirect URI in your OAuth app matches NeoAgent's callback URL
-3. Confirm the client ID and secret are set in server config
-4. Restart after changing environment variables: `neoagent restart`
+If an OAuth connection fails:
+* Confirm PUBLIC_URL is reachable by the provider
+* Confirm the redirect URI in your OAuth app matches NeoAgent's callback URL
+* Confirm the client ID and secret are set in server config
+* Restart after changing environment variables: `neoagent restart`
 
 ## Messaging Platforms
 
