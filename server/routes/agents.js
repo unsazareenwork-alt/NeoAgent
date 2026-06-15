@@ -1,0 +1,231 @@
+const express = require('express');
+const router = express.Router();
+const db = require('../db/database');
+const { requireAuth } = require('../middleware/auth');
+const { sanitizeError } = require('../utils/security');
+const { getAgentIdFromRequest, resolveAgentId } = require('../services/agents/manager');
+const { listRunEvents } = require('../services/ai/runEvents');
+const { isInterimAssistantMetadata } = require('../services/ai/interim');
+const { buildAgentRunContext } = require('./_helpers/agentRunContext');
+
+router.use(requireAuth);
+
+// List agent runs
+router.get('/', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
+  const agentId = resolveAgentId(req.session.userId, getAgentIdFromRequest(req));
+  const runs = db.prepare('SELECT * FROM agent_runs WHERE user_id = ? AND agent_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?')
+    .all(req.session.userId, agentId, limit, offset);
+  const total = db.prepare('SELECT COUNT(*) as count FROM agent_runs WHERE user_id = ? AND agent_id = ?').get(req.session.userId, agentId).count;
+  res.json({ runs, total, limit, offset, agentId });
+});
+
+// Chat history (web + social messages merged)
+router.get('/chat-history', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+  const userId = req.session.userId;
+  const agentId = resolveAgentId(userId, getAgentIdFromRequest(req));
+
+  const webMsgs = db.prepare(`
+    SELECT
+      id,
+      role,
+      content,
+      COALESCE(json_extract(metadata, '$.platform'), 'web') AS platform,
+      NULL AS sender_name,
+      created_at,
+      agent_run_id AS run_id,
+      metadata,
+      NULL AS tool_calls
+    FROM conversation_history WHERE user_id = ? AND agent_id = ? ORDER BY created_at DESC LIMIT ?
+  `).all(userId, agentId, limit);
+
+  const socialMsgs = db.prepare(`
+    SELECT
+      id,
+      role,
+      content,
+      platform,
+      json_extract(metadata, '$.senderName') AS sender_name,
+      created_at,
+      run_id,
+      metadata,
+      tool_calls
+    FROM messages WHERE user_id = ? AND agent_id = ? AND platform != 'web'
+    ORDER BY created_at DESC LIMIT ?
+  `).all(userId, agentId, limit);
+
+  // Normalize SQL datetime ('YYYY-MM-DD HH:MM:SS', treated as local) and ISO-Z strings to ms
+  const toMs = (s) => {
+    if (!s) return 0;
+    const normalized = s.includes('T') ? s : s.replace(' ', 'T') + 'Z';
+    return new Date(normalized).getTime();
+  };
+
+  const all = [...webMsgs, ...socialMsgs]
+    .sort((a, b) => toMs(a.created_at) - toMs(b.created_at))
+    .slice(-limit);
+
+  res.json({ messages: all, agentId });
+});
+
+// Create new agent run
+router.post('/', async (req, res) => {
+  try {
+    const { task, options } = req.body;
+    const agentId = resolveAgentId(req.session.userId, getAgentIdFromRequest(req));
+    if (!task || typeof task !== 'string') return res.status(400).json({ error: 'Task must be a non-empty string' });
+    if (task.length > 50000) return res.status(400).json({ error: 'Task exceeds maximum length of 50,000 characters' });
+
+    const commandRouter = req.app?.locals?.commandRouter;
+    if (commandRouter) {
+      const commandResult = await commandRouter.dispatch(task, {
+        userId: req.session.userId,
+        agentId,
+        source: 'http'
+      });
+      if (commandResult?.handled) {
+        return res.json({
+          command: true,
+          content: commandResult.content || 'Done.',
+          events: commandResult.events || []
+        });
+      }
+    }
+
+    db.prepare('INSERT INTO conversation_history (user_id, agent_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)')
+      .run(req.session.userId, agentId, 'user', task, JSON.stringify({ platform: 'flutter' }));
+
+    const engine = req.app?.locals?.agentEngine;
+    const memoryManager = req.app?.locals?.memoryManager;
+    if (!engine || !memoryManager) {
+      return res.status(500).json({ error: 'Agent engine or memory manager is not initialized.' });
+    }
+    const conversationId = options?.conversationId || memoryManager.getDefaultWebConversationId(req.session.userId, { agentId });
+    const { priorMessages, priorSummary } = buildAgentRunContext({
+      userId: req.session.userId,
+      agentId,
+      task,
+    });
+    const result = await engine.run(req.session.userId, task, {
+      ...(options || {}),
+      agentId,
+      conversationId,
+      priorMessages,
+      priorSummary,
+    });
+
+    if (result?.status === 'completed' && result?.content) {
+      db.prepare('INSERT INTO conversation_history (user_id, agent_id, agent_run_id, role, content, metadata) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(
+          req.session.userId,
+          agentId,
+          result.runId,
+          'assistant',
+          result.content,
+          JSON.stringify({ tokens: result.totalTokens, platform: 'flutter' })
+        );
+    }
+
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: sanitizeError(err) });
+  }
+});
+
+// Get specific run
+router.get('/:id', (req, res) => {
+  const run = db.prepare('SELECT * FROM agent_runs WHERE id = ? AND user_id = ?').get(req.params.id, req.session.userId);
+  if (!run) return res.status(404).json({ error: 'Run not found' });
+
+  const steps = db.prepare('SELECT * FROM agent_steps WHERE run_id = ? ORDER BY step_index ASC').all(run.id);
+  const history = db.prepare('SELECT * FROM conversation_history WHERE agent_run_id = ? ORDER BY created_at ASC').all(run.id);
+
+  res.json({ run, steps, history });
+});
+
+// Get detailed steps for a run (for activity history replay)
+router.get('/:id/steps', (req, res) => {
+  const run = db.prepare('SELECT * FROM agent_runs WHERE id = ? AND user_id = ?').get(req.params.id, req.session.userId);
+  if (!run) return res.status(404).json({ error: 'Run not found' });
+
+  const steps = db.prepare('SELECT * FROM agent_steps WHERE run_id = ? ORDER BY step_index ASC').all(run.id);
+  const historyRows = db.prepare(
+    `SELECT content, metadata FROM conversation_history WHERE user_id = ? AND agent_run_id = ? AND role = 'assistant' ORDER BY created_at ASC`
+  ).all(req.session.userId, run.id);
+  const latestHistoryAssistant = [...historyRows].reverse().find((row) => String(row?.content || '').trim());
+  const historyResponse = [...historyRows]
+    .reverse()
+    .find((row) => !isInterimAssistantMetadata(row?.metadata));
+  const sentMessages = db.prepare(
+    `SELECT content, metadata FROM messages WHERE user_id = ? AND run_id = ? AND role = 'assistant' ORDER BY created_at ASC, id ASC`
+  ).all(req.session.userId, run.id);
+  const latestSentAssistant = [...sentMessages]
+    .reverse()
+    .find((row) => String(row?.content || '').trim());
+  const sentResponse = sentMessages
+    .filter((row) => !isInterimAssistantMetadata(row?.metadata))
+    .map((row) => row?.content?.toString().trim() || '')
+    .filter(Boolean)
+    .join('\n\n');
+  const response =
+    sentResponse
+    || historyResponse?.content
+    || latestSentAssistant?.content
+    || latestHistoryAssistant?.content
+    || run.final_response
+    || null;
+
+  res.json({ run, steps, events: listRunEvents(run.id), response });
+});
+
+// Abort a run
+router.post('/:id/abort', (req, res) => {
+  try {
+    const run = db.prepare('SELECT id FROM agent_runs WHERE id = ? AND user_id = ?').get(req.params.id, req.session.userId);
+    if (!run) return res.status(404).json({ error: 'Run not found' });
+    const engine = req.app.locals.agentEngine;
+    engine.abort(req.params.id, { userId: req.session.userId });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: sanitizeError(err) });
+  }
+});
+
+// Delete a run
+router.delete('/:id', (req, res) => {
+  const run = db.prepare('SELECT id FROM agent_runs WHERE id = ? AND user_id = ?').get(req.params.id, req.session.userId);
+  if (!run) return res.status(404).json({ error: 'Run not found' });
+
+  db.prepare('DELETE FROM agent_steps WHERE run_id = ?').run(run.id);
+  db.prepare('DELETE FROM conversation_history WHERE agent_run_id = ?').run(run.id);
+  db.prepare('DELETE FROM agent_runs WHERE id = ?').run(run.id);
+  res.json({ success: true });
+});
+
+// Multi-step task
+router.post('/multi-step', async (req, res) => {
+  try {
+    const { task, steps, options } = req.body;
+    const agentId = resolveAgentId(req.session.userId, getAgentIdFromRequest(req));
+    if (!task || typeof task !== 'string') return res.status(400).json({ error: 'Task must be a non-empty string' });
+    if (task.length > 50000) return res.status(400).json({ error: 'Task exceeds maximum length of 50,000 characters' });
+
+    const multiStep = req.app.locals.multiStep;
+    if (!multiStep || typeof multiStep.planAndExecute !== 'function') {
+      return res.status(500).json({ error: 'Multi-step orchestrator is not initialized.' });
+    }
+    const result = await multiStep.planAndExecute(req.session.userId, task, {
+      ...(options || {}),
+      agentId,
+      requestedSteps: Array.isArray(steps) ? steps : [],
+      forceMode: 'plan_execute',
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: sanitizeError(err) });
+  }
+});
+
+module.exports = router;

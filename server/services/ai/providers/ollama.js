@@ -1,0 +1,251 @@
+const { BaseProvider } = require('./base');
+
+class OllamaProvider extends BaseProvider {
+  constructor(config = {}) {
+    super(config);
+    this.name = 'ollama';
+    this.baseUrl = config.baseUrl || process.env.OLLAMA_URL || 'http://localhost:11434';
+    this.models = [];
+  }
+
+  async listModels() {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(`${this.baseUrl}/api/tags`, { signal: controller.signal });
+      clearTimeout(timer);
+      const data = await res.json();
+      this.models = (data.models || []).map(m => m.name);
+      return this.models;
+    } catch {
+      return [];
+    }
+  }
+
+  async ensureModel(model) {
+    const models = await this.listModels();
+    // Normalization: Ollama often adds :latest if no tag is specified
+    const normalizedModel = model.includes(':') ? model : `${model}:latest`;
+    const found = models.some(m => m === model || m === normalizedModel);
+    
+    if (found) return true;
+
+    console.log(`[Ollama] Model '${model}' not found, pulling from registry...`);
+    this.onStatus?.({
+      kind: 'model_download',
+      status: 'started',
+      model,
+      phase: 'Downloading model',
+      message: `Downloading local Ollama model '${model}'. First-time pulls can take a while.`
+    });
+    try {
+      const res = await fetch(`${this.baseUrl}/api/pull`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: model, stream: false })
+      });
+      if (!res.ok) throw new Error(`Pull failed: ${res.statusText}`);
+      console.log(`[Ollama] Model '${model}' pulled successfully.`);
+      this.onStatus?.({
+        kind: 'model_download',
+        status: 'completed',
+        model,
+        phase: 'Thinking',
+        message: `Local Ollama model '${model}' is ready.`
+      });
+      // Refresh local model list
+      await this.listModels();
+      return true;
+    } catch (e) {
+      this.onStatus?.({
+        kind: 'model_download',
+        status: 'failed',
+        model,
+        phase: 'Model download failed',
+        message: `Failed to download local Ollama model '${model}': ${e.message}`
+      });
+      console.error(`[Ollama] Failed to pull model '${model}':`, e.message);
+      throw e;
+    }
+  }
+
+  getContextWindow(model) {
+    return 128000;
+  }
+
+  formatToolsForOllama(tools) {
+    return tools.map(tool => ({
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters || { type: 'object', properties: {} }
+      }
+    }));
+  }
+
+  buildChatBody(messages, tools, options, stream) {
+    const body = {
+      model: options.model || this.config.model || 'llama3.1',
+      messages: messages.map(m => {
+        const msg = {
+          role: m.role,
+          content: m.content || '',
+          ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {})
+        };
+        if (m.tool_calls) {
+          msg.tool_calls = m.tool_calls.map(tc => ({
+            ...tc,
+            function: {
+              ...tc.function,
+              arguments: typeof tc.function.arguments === 'string'
+                ? (function() { try { return JSON.parse(tc.function.arguments || '{}'); } catch(e) { return {}; } })()
+                : tc.function.arguments
+            }
+          }));
+        }
+        return msg;
+      }),
+      stream,
+      options: {
+        temperature: options.temperature ?? 0.7,
+        num_predict: options.maxTokens || 16384
+      }
+    };
+    if (tools.length > 0) {
+      body.tools = this.formatToolsForOllama(tools);
+    }
+    return body;
+  }
+
+  // Ollama returns HTTP 200 with an error body for some failures and a non-2xx
+  // status for others; surface both as real errors instead of letting callers
+  // see a silently empty response. Tags models that reject tools so the caller
+  // can transparently retry without them.
+  async postChat(body) {
+    const res = await fetch(`${this.baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      let message = detail;
+      try { message = JSON.parse(detail)?.error || detail; } catch {}
+      const err = new Error(`Ollama /api/chat failed (HTTP ${res.status}): ${message || res.statusText}`);
+      if (/does not support tools|tools.*not supported/i.test(message)) {
+        err.code = 'OLLAMA_TOOLS_UNSUPPORTED';
+      }
+      throw err;
+    }
+    return res;
+  }
+
+  async chat(messages, tools = [], options = {}) {
+    const model = options.model || this.config.model || 'llama3.1';
+    await this.ensureModel(model);
+
+    let res;
+    try {
+      res = await this.postChat(this.buildChatBody(messages, tools, { ...options, model }, false));
+    } catch (err) {
+      if (err.code === 'OLLAMA_TOOLS_UNSUPPORTED' && tools.length > 0) {
+        console.warn(`[Ollama] Model '${model}' does not support tools; retrying without them.`);
+        res = await this.postChat(this.buildChatBody(messages, [], { ...options, model }, false));
+      } else {
+        throw err;
+      }
+    }
+
+    const data = await res.json();
+    const msg = data.message || {};
+
+    return {
+      content: msg.content || '',
+      toolCalls: (msg.tool_calls || []).map((tc, i) => ({
+        id: `call_ollama_${Date.now()}_${i}`,
+        type: 'function',
+        function: {
+          name: tc.function.name,
+          arguments: JSON.stringify(tc.function.arguments || {})
+        }
+      })),
+      finishReason: msg.tool_calls?.length > 0 ? 'tool_calls' : 'stop',
+      usage: data.prompt_eval_count ? {
+        promptTokens: data.prompt_eval_count || 0,
+        completionTokens: data.eval_count || 0,
+        totalTokens: (data.prompt_eval_count || 0) + (data.eval_count || 0)
+      } : null,
+      model: data.model || model
+    };
+  }
+
+  async *stream(messages, tools = [], options = {}) {
+    const model = options.model || this.config.model || 'llama3.1';
+    await this.ensureModel(model);
+
+    let res;
+    try {
+      res = await this.postChat(this.buildChatBody(messages, tools, { ...options, model }, true));
+    } catch (err) {
+      if (err.code === 'OLLAMA_TOOLS_UNSUPPORTED' && tools.length > 0) {
+        console.warn(`[Ollama] Model '${model}' does not support tools; retrying stream without them.`);
+        res = await this.postChat(this.buildChatBody(messages, [], { ...options, model }, true));
+      } else {
+        throw err;
+      }
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let content = '';
+    let buffer = '';
+    let accumulatedToolCalls = [];
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const data = JSON.parse(line);
+          if (data.message?.content) {
+            content += data.message.content;
+            yield { type: 'content', content: data.message.content };
+          }
+          if (data.message?.tool_calls && Array.isArray(data.message.tool_calls)) {
+            const mapped = data.message.tool_calls.map((tc, i) => ({
+              id: `call_ollama_${Date.now()}_${i}`,
+              type: 'function',
+              function: {
+                name: tc.function.name,
+                arguments: typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments || {})
+              }
+            }));
+            accumulatedToolCalls = accumulatedToolCalls.concat(mapped);
+          }
+          if (data.done) {
+            yield {
+              type: 'done',
+              content,
+              toolCalls: accumulatedToolCalls,
+              finishReason: accumulatedToolCalls.length > 0 ? 'tool_calls' : 'stop',
+              usage: data.prompt_eval_count ? {
+                promptTokens: data.prompt_eval_count || 0,
+                completionTokens: data.eval_count || 0,
+                totalTokens: (data.prompt_eval_count || 0) + (data.eval_count || 0)
+              } : null
+            };
+          }
+        } catch {}
+      }
+    }
+  }
+}
+
+module.exports = { OllamaProvider };

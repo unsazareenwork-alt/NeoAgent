@@ -1,0 +1,129 @@
+name: Release Manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: Version bump type
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  release:
+    name: Bump version and publish manual release
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.bump.outputs.version }}
+      release_sha: ${{ steps.capture_release_sha.outputs.release_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve latest tag and bump version
+        id: bump
+        run: |
+          git fetch --tags --force
+
+          LATEST_TAG=$(git tag --list "v*" --sort=-v:refname | head -n 1)
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="v1.0.0"
+          fi
+
+          LATEST_VERSION=${LATEST_TAG#v}
+          echo "Syncing package.json to latest known release ($LATEST_VERSION)..."
+
+          npm version "$LATEST_VERSION" --no-git-tag-version --allow-same-version
+          npm version "${{ github.event.inputs.version_bump }}" --no-git-tag-version
+
+          NEW_VERSION=$(node -p "require('./package.json').version")
+
+          git add package.json package-lock.json || true
+          git commit -m "chore(release): v${NEW_VERSION} [skip ci]"
+          git tag "v${NEW_VERSION}" -m "chore(release): v${NEW_VERSION}"
+
+          echo "NEW_VERSION=v${NEW_VERSION}" >> "$GITHUB_ENV"
+          echo "version=v${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Push version bump
+        run: |
+          git push origin HEAD
+          git push origin "${{ env.NEW_VERSION }}"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build bundled web client
+        run: NEOAGENT_BACKEND_URL='' npm run flutter:build:web
+
+      - name: Verify production web bundle
+        run: |
+          if rg -n "http://localhost:3333|127\\.0\\.0\\.1:3333" server/public/main.dart.js; then
+            echo "Bundled web client still points at localhost."
+            exit 1
+          fi
+
+      - name: Publish package to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ env.NEW_VERSION }}" \
+            --title "Release ${{ env.NEW_VERSION }}" \
+            --generate-notes \
+            --latest
+
+      - name: Capture release sha
+        id: capture_release_sha
+        run: |
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build-installers:
+    name: Build Installers
+    needs: release
+    uses: ./.github/workflows/_build-installers.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.release.outputs.release_sha }}
+      release_tag: ${{ needs.release.outputs.release_tag }}
+
+  publish-release-assets:
+    name: Publish Release Assets
+    needs:
+      - release
+      - build-installers
+    uses: ./.github/workflows/_publish-release-assets.yml
+    with:
+      release_tag: ${{ needs.release.outputs.release_tag }}

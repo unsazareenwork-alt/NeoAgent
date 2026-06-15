@@ -1,0 +1,120 @@
+name: Release Stable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  release:
+    name: Promote beta and publish stable release
+    if: github.event_name == 'workflow_dispatch' || github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.capture_release_tag.outputs.release_tag }}
+      release_sha: ${{ steps.capture_release_sha.outputs.release_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Promote beta to main
+        run: |
+          git fetch origin main beta --tags --force
+          git checkout main
+          git merge --no-ff origin/beta -m "chore(release): promote beta to main [skip ci]"
+          git push origin HEAD:main
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build bundled web client
+        run: NEOAGENT_BACKEND_URL='' npm run flutter:build:web
+
+      - name: Verify production web bundle
+        run: |
+          if rg -n "http://localhost:3333|127\\.0\\.0\\.1:3333" server/public/main.dart.js; then
+            echo "Bundled web client still points at localhost."
+            exit 1
+          fi
+
+      - name: Check npm auth
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm whoami --registry=https://registry.npmjs.org/
+
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npx -p semantic-release -p @semantic-release/commit-analyzer -p @semantic-release/release-notes-generator -p @semantic-release/npm -p @semantic-release/github semantic-release
+
+      - name: Capture release tag
+        id: capture_release_tag
+        run: |
+          RELEASE_TAG="$(
+            git tag --points-at HEAD --list 'v*' \
+              | sed -nE '/^v[0-9]+\.[0-9]+\.[0-9]+$/p' \
+              | sort -V \
+              | tail -n 1
+          )"
+          if [ -z "$RELEASE_TAG" ]; then
+            echo "No stable release tag found at $(git rev-parse HEAD) after semantic-release."
+            exit 1
+          fi
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Capture release sha
+        id: capture_release_sha
+        run: |
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build-installers:
+    name: Build Installers
+    needs: release
+    uses: ./.github/workflows/_build-installers.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.release.outputs.release_sha }}
+      release_tag: ${{ needs.release.outputs.release_tag }}
+
+  build-firmware:
+    name: Build Wearable Firmware
+    needs: release
+    uses: ./.github/workflows/_build-firmware.yml
+    with:
+      ref: ${{ needs.release.outputs.release_sha }}
+      release_tag: ${{ needs.release.outputs.release_tag }}
+
+  publish-release-assets:
+    name: Publish Release Assets
+    needs:
+      - release
+      - build-installers
+      - build-firmware
+    uses: ./.github/workflows/_publish-release-assets.yml
+    with:
+      release_tag: ${{ needs.release.outputs.release_tag }}

@@ -1,0 +1,48 @@
+//
+//  Generated file. Do not edit.
+//
+
+import FlutterMacOS
+import Foundation
+
+import audioplayers_darwin
+import connectivity_plus
+import desktop_audio_capture
+import file_picker
+import flutter_secure_storage_macos
+import geolocator_apple
+import hotkey_manager_macos
+import mixpanel_flutter
+import mobile_scanner
+import package_info_plus
+import path_provider_foundation
+import record_macos
+import screen_retriever_macos
+import shared_preferences_foundation
+import tray_manager
+import universal_ble
+import url_launcher_macos
+import video_player_avfoundation
+import window_manager
+
+func RegisterGeneratedPlugins(registry: FlutterPluginRegistry) {
+  AudioplayersDarwinPlugin.register(with: registry.registrar(forPlugin: "AudioplayersDarwinPlugin"))
+  ConnectivityPlusPlugin.register(with: registry.registrar(forPlugin: "ConnectivityPlusPlugin"))
+  AudioCapturePlugin.register(with: registry.registrar(forPlugin: "AudioCapturePlugin"))
+  FilePickerPlugin.register(with: registry.registrar(forPlugin: "FilePickerPlugin"))
+  FlutterSecureStoragePlugin.register(with: registry.registrar(forPlugin: "FlutterSecureStoragePlugin"))
+  GeolocatorPlugin.register(with: registry.registrar(forPlugin: "GeolocatorPlugin"))
+  HotkeyManagerMacosPlugin.register(with: registry.registrar(forPlugin: "HotkeyManagerMacosPlugin"))
+  MixpanelFlutterPlugin.register(with: registry.registrar(forPlugin: "MixpanelFlutterPlugin"))
+  MobileScannerPlugin.register(with: registry.registrar(forPlugin: "MobileScannerPlugin"))
+  FPPPackageInfoPlusPlugin.register(with: registry.registrar(forPlugin: "FPPPackageInfoPlusPlugin"))
+  PathProviderPlugin.register(with: registry.registrar(forPlugin: "PathProviderPlugin"))
+  RecordMacOsPlugin.register(with: registry.registrar(forPlugin: "RecordMacOsPlugin"))
+  ScreenRetrieverMacosPlugin.register(with: registry.registrar(forPlugin: "ScreenRetrieverMacosPlugin"))
+  SharedPreferencesPlugin.register(with: registry.registrar(forPlugin: "SharedPreferencesPlugin"))
+  TrayManagerPlugin.register(with: registry.registrar(forPlugin: "TrayManagerPlugin"))
+  UniversalBlePlugin.register(with: registry.registrar(forPlugin: "UniversalBlePlugin"))
+  UrlLauncherPlugin.register(with: registry.registrar(forPlugin: "UrlLauncherPlugin"))
+  FVPVideoPlayerPlugin.register(with: registry.registrar(forPlugin: "FVPVideoPlayerPlugin"))
+  WindowManagerPlugin.register(with: registry.registrar(forPlugin: "WindowManagerPlugin"))
+}

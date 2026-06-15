@@ -1,0 +1,27 @@
+name: Build Installers
+
+on:
+  push:
+    branches:
+      - main
+      - beta
+  pull_request:
+    branches:
+      - beta
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to version build artifacts with, for example v1.2.3 or v1.2.3-beta.0
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-installers:
+    uses: ./.github/workflows/_build-installers.yml
+    secrets: inherit
+    with:
+      ref: ${{ github.sha }}
+      release_tag: ${{ github.event.inputs.release_tag || '' }}

@@ -1,0 +1,367 @@
+const Anthropic = require('@anthropic-ai/sdk');
+const { BaseProvider } = require('./base');
+
+class AnthropicProvider extends BaseProvider {
+  constructor(config = {}) {
+    super(config);
+    this.name = 'anthropic';
+    this.models = [
+      'claude-opus-4-8',
+      'claude-opus-4-7',
+      'claude-sonnet-4-6',
+      'claude-sonnet-4-20250514',
+      'claude-haiku-4-5-20251001',
+      'claude-3-5-haiku-20241022',
+      'claude-3-5-sonnet-20241022',
+      'claude-3-opus-20240229',
+    ];
+    this.contextWindows = {
+      'claude-opus-4-8': 1000000,
+      'claude-opus-4-7': 200000,
+      'claude-sonnet-4-6': 200000,
+      'claude-sonnet-4-20250514': 200000,
+      'claude-haiku-4-5-20251001': 200000,
+      'claude-3-5-haiku-20241022': 200000,
+      'claude-3-5-sonnet-20241022': 200000,
+      'claude-3-opus-20240229': 200000,
+    };
+    this.client = new Anthropic({
+      apiKey: config.apiKey || process.env.ANTHROPIC_API_KEY,
+      baseURL: config.baseUrl || process.env.ANTHROPIC_BASE_URL || undefined
+    });
+  }
+
+  async listModels() {
+    const res = await this.client.models.list({ limit: 100 });
+    return (res.data || []).map((m) => ({ id: m.id, name: m.display_name || m.id }));
+  }
+
+  getContextWindow(model) {
+    return this.contextWindows[model] || 200000;
+  }
+
+  formatTools(tools) {
+    return tools.map(tool => ({
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.parameters || { type: 'object', properties: {} }
+    }));
+  }
+
+  normalizeContentBlocks(blocks = []) {
+    if (!Array.isArray(blocks)) {
+      if (blocks && typeof blocks === 'object' && blocks.type) {
+        blocks = [blocks];
+      } else {
+        return [];
+      }
+    }
+
+    const normalized = [];
+
+    for (const block of blocks) {
+      if (!block || !block.type) continue;
+
+      if (block.type === 'thinking') {
+        normalized.push({
+          type: 'thinking',
+          thinking: block.thinking || '',
+          ...(block.signature ? { signature: block.signature } : {})
+        });
+        continue;
+      }
+
+      if (block.type === 'redacted_thinking') {
+        normalized.push({
+          type: 'redacted_thinking',
+          data: block.data
+        });
+        continue;
+      }
+
+      if (block.type === 'text') {
+        normalized.push({
+          type: 'text',
+          text: block.text || ''
+        });
+        continue;
+      }
+
+      if (block.type === 'tool_use') {
+        normalized.push({
+          type: 'tool_use',
+          id: block.id,
+          name: block.name,
+          input: block.input || {}
+        });
+      }
+    }
+
+    return normalized;
+  }
+
+  convertMessages(messages) {
+    const system = [];
+    const converted = [];
+
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        system.push({
+          type: 'text',
+          text: String(msg.content || ''),
+        });
+        continue;
+      }
+
+      if (msg.role === 'tool') {
+        converted.push({
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: msg.tool_call_id,
+            content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
+          }]
+        });
+        continue;
+      }
+
+      if (msg.role === 'assistant' && msg.tool_calls) {
+        if (Array.isArray(msg.providerContentBlocks) && msg.providerContentBlocks.length > 0) {
+          converted.push({
+            role: 'assistant',
+            content: this.normalizeContentBlocks(msg.providerContentBlocks)
+          });
+          continue;
+        }
+
+        const content = [];
+        if (msg.content) content.push({ type: 'text', text: msg.content });
+        for (const tc of msg.tool_calls) {
+          content.push({
+            type: 'tool_use',
+            id: tc.id,
+            name: tc.function.name,
+            input: JSON.parse(tc.function.arguments || '{}')
+          });
+        }
+        converted.push({ role: 'assistant', content });
+        continue;
+      }
+
+      converted.push({
+        role: msg.role === 'assistant' ? 'assistant' : 'user',
+        content: msg.content
+      });
+    }
+
+    return { system, messages: converted };
+  }
+
+  async chat(messages, tools = [], options = {}) {
+    const model = options.model || this.config.model || this.getDefaultModel();
+    const { system, messages: converted } = this.convertMessages(messages);
+
+    const params = {
+      model,
+      max_tokens: options.maxTokens || 16384,
+      messages: converted
+    };
+
+    if (system.length > 0) params.system = system;
+    if (tools.length > 0) params.tools = this.formatTools(tools);
+    const response = await this.client.messages.create(params);
+    const responseBlocks = Array.isArray(response?.content)
+      ? response.content
+      : (response?.content && typeof response.content === 'object' ? [response.content] : []);
+
+    let content = '';
+    const toolCalls = [];
+    const providerContentBlocks = this.normalizeContentBlocks(responseBlocks);
+
+    for (const block of responseBlocks) {
+      if (block.type === 'text') {
+        content += block.text;
+      } else if (block.type === 'tool_use') {
+        toolCalls.push({
+          id: block.id,
+          type: 'function',
+          function: {
+            name: block.name,
+            arguments: JSON.stringify(block.input)
+          }
+        });
+      }
+    }
+
+    return {
+      content,
+      toolCalls,
+      providerContentBlocks,
+      finishReason: response.stop_reason === 'tool_use' ? 'tool_calls' : 'stop',
+      usage: {
+        inputTokens: response.usage.input_tokens,
+        outputTokens: response.usage.output_tokens,
+        reasoningTokens: 0,
+        cachedReadTokens: response.usage.cache_read_input_tokens || 0,
+        cacheWriteTokens: response.usage.cache_creation_input_tokens || 0,
+        promptTokens: response.usage.input_tokens,
+        completionTokens: response.usage.output_tokens,
+        totalTokens: response.usage.input_tokens + response.usage.output_tokens
+      },
+      model: response.model
+    };
+  }
+
+  async *stream(messages, tools = [], options = {}) {
+    const model = options.model || this.config.model || this.getDefaultModel();
+    const { system, messages: converted } = this.convertMessages(messages);
+
+    const params = {
+      model,
+      max_tokens: options.maxTokens || 16384,
+      messages: converted,
+      stream: true
+    };
+
+    if (system.length > 0) params.system = system;
+    if (tools.length > 0) params.tools = this.formatTools(tools);
+    const stream = await this.client.messages.stream(params);
+
+    let content = '';
+    let currentToolCalls = [];
+    let currentToolIndex = -1;
+    const providerContentBlocks = [];
+    let finalUsage = null;
+
+    for await (const event of stream) {
+      if (event.type === 'message_start' && event.message?.usage) {
+        finalUsage = {
+          inputTokens: event.message.usage.input_tokens || 0,
+          outputTokens: event.message.usage.output_tokens || 0,
+          reasoningTokens: 0,
+          cachedReadTokens: event.message.usage.cache_read_input_tokens || 0,
+          cacheWriteTokens: event.message.usage.cache_creation_input_tokens || 0,
+          promptTokens: event.message.usage.input_tokens || 0,
+          completionTokens: event.message.usage.output_tokens || 0,
+          totalTokens: (event.message.usage.input_tokens || 0) + (event.message.usage.output_tokens || 0),
+        };
+      } else if (event.type === 'content_block_start') {
+        if (event.content_block.type === 'thinking') {
+          providerContentBlocks[event.index] = {
+            type: 'thinking',
+            thinking: event.content_block.thinking || '',
+            signature: event.content_block.signature || ''
+          };
+        } else if (event.content_block.type === 'redacted_thinking') {
+          providerContentBlocks[event.index] = {
+            type: 'redacted_thinking',
+            data: event.content_block.data
+          };
+        } else if (event.content_block.type === 'text') {
+          providerContentBlocks[event.index] = {
+            type: 'text',
+            text: event.content_block.text || ''
+          };
+        } else if (event.content_block.type === 'tool_use') {
+          currentToolIndex++;
+          currentToolCalls.push({
+            id: event.content_block.id,
+            type: 'function',
+            function: { name: event.content_block.name, arguments: '' }
+          });
+          providerContentBlocks[event.index] = {
+            type: 'tool_use',
+            id: event.content_block.id,
+            name: event.content_block.name,
+            input: {}
+          };
+        }
+      } else if (event.type === 'content_block_delta') {
+        if (event.delta.type === 'text_delta') {
+          content += event.delta.text;
+          if (providerContentBlocks[event.index]?.type === 'text') {
+            providerContentBlocks[event.index].text += event.delta.text;
+          }
+          yield { type: 'content', content: event.delta.text };
+        } else if (event.delta.type === 'thinking_delta') {
+          if (providerContentBlocks[event.index]?.type === 'thinking') {
+            providerContentBlocks[event.index].thinking += event.delta.thinking || '';
+          }
+        } else if (event.delta.type === 'signature_delta') {
+          if (providerContentBlocks[event.index]?.type === 'thinking') {
+            providerContentBlocks[event.index].signature = event.delta.signature || '';
+          }
+        } else if (event.delta.type === 'input_json_delta') {
+          if (currentToolCalls[currentToolIndex]) {
+            currentToolCalls[currentToolIndex].function.arguments += event.delta.partial_json;
+          }
+          if (providerContentBlocks[event.index]?.type === 'tool_use') {
+            const currentJson = providerContentBlocks[event.index]._inputJson || '';
+            providerContentBlocks[event.index]._inputJson = currentJson + (event.delta.partial_json || '');
+          }
+        }
+      } else if (event.type === 'message_delta' && event.usage) {
+        const inputTokens = finalUsage?.inputTokens || 0;
+        const cachedReadTokens = finalUsage?.cachedReadTokens || 0;
+        const cacheWriteTokens = finalUsage?.cacheWriteTokens || 0;
+        finalUsage = {
+          inputTokens,
+          outputTokens: event.usage.output_tokens || 0,
+          reasoningTokens: 0,
+          cachedReadTokens,
+          cacheWriteTokens,
+          promptTokens: inputTokens,
+          completionTokens: event.usage.output_tokens || 0,
+          totalTokens: inputTokens + (event.usage.output_tokens || 0),
+        };
+      } else if (event.type === 'message_stop') {
+        const normalizedBlocks = providerContentBlocks
+          .filter(Boolean)
+          .map((block) => {
+            if (block.type === 'tool_use') {
+              let parsedInput = block.input || {};
+              if (typeof block._inputJson === 'string' && block._inputJson.trim()) {
+                try {
+                  parsedInput = JSON.parse(block._inputJson);
+                } catch { }
+              }
+              return {
+                type: 'tool_use',
+                id: block.id,
+                name: block.name,
+                input: parsedInput
+              };
+            }
+            if (block.type === 'thinking') {
+              return {
+                type: 'thinking',
+                thinking: block.thinking || '',
+                ...(block.signature ? { signature: block.signature } : {})
+              };
+            }
+            if (block.type === 'redacted_thinking') {
+              return {
+                type: 'redacted_thinking',
+                data: block.data
+              };
+            }
+            return {
+              type: 'text',
+              text: block.text || ''
+            };
+          });
+
+        yield {
+          type: 'done',
+          content,
+          toolCalls: currentToolCalls,
+          providerContentBlocks: normalizedBlocks,
+          finishReason: currentToolCalls.length > 0 ? 'tool_calls' : 'stop',
+          usage: finalUsage
+        };
+      }
+    }
+  }
+}
+
+module.exports = { AnthropicProvider };
